@@ -17,10 +17,16 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _FRAME_NPZ = os.path.join(_HERE, "frame_overlay.npz")
 
 
-def _load_frame_overlay() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_frame_overlay() -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     if os.path.isfile(_FRAME_NPZ):
         d = np.load(_FRAME_NPZ)
-        return d["frame_rgba"].astype(np.uint8), d["frame_mask"].astype(bool), d["alpha_mask"].astype(np.uint8)
+        light_overlay = d["light_overlay_rgba"].astype(np.float32) if "light_overlay_rgba" in d else None
+        return (
+            d["frame_rgba"].astype(np.uint8),
+            d["frame_mask"].astype(bool),
+            d["alpha_mask"].astype(np.uint8),
+            light_overlay,
+        )
     # Fallback parametric rounded frame if npz is missing
     rgba = np.zeros((ICON_H, ICON_W, 4), dtype=np.uint8)
     mask = np.ones((ICON_H, ICON_W), dtype=bool)
@@ -30,7 +36,7 @@ def _load_frame_overlay() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     for y in (0, 1, ICON_H - 2, ICON_H - 1):
         for x in (0, 1, ICON_W - 2, ICON_W - 1):
             rgba[y, x, 3] = 0
-    return rgba, mask, rgba[:, :, 3].copy()
+    return rgba, mask, rgba[:, :, 3].copy(), None
 
 
 def build_studio_backgrounds() -> Tuple[np.ndarray, np.ndarray]:
@@ -132,12 +138,16 @@ def _unsharp_mask_rgb(rgb: np.ndarray, amount: float = 0.45) -> np.ndarray:
     return np.clip(rgb + amount * (rgb - blur), 0.0, 255.0)
 
 
-def _make_hover_state(rgb00: np.ndarray) -> np.ndarray:
-    """Transform _00 RGB [0..255] into _01 (hover/highlighted) matching original game icons."""
+def _make_hover_state(rgb00: np.ndarray, light_overlay: Optional[np.ndarray] = None) -> np.ndarray:
+    """Transform _00 RGB [0..255] into _01 (hover/highlighted) and apply top light overlay."""
     norm = np.clip(rgb00 / 255.0, 0.0, 1.0)
     # Bright lift matching MoW:AS2 hover state (bright cream backdrop + lifted vehicle highlights)
     lifted = np.power(norm, 0.64) * 255.0
     lifted = lifted * 0.98 + 14.0
+    if light_overlay is not None:
+        ov_rgb = light_overlay[:, :, :3]
+        ov_a = np.clip(light_overlay[:, :, 3:4] / 255.0, 0.0, 1.0)
+        lifted = ov_rgb * ov_a + lifted * (1.0 - ov_a)
     return np.clip(lifted, 0.0, 255.0)
 
 
@@ -187,7 +197,7 @@ def compose_icon_set(
 
     bg00, bg02 = build_studio_backgrounds()
     bevel = build_inner_bevel()
-    frame_rgba, frame_mask, alpha_mask = _load_frame_overlay()
+    frame_rgba, frame_mask, alpha_mask, light_overlay = _load_frame_overlay()
 
     # Ground shadow darkens the backdrop before compositing the vehicle
     bg00_sh = bg00 * (1.0 - sh_lo * 0.72)
@@ -197,8 +207,8 @@ def compose_icon_set(
     comp00 = (rgb_lo * a_lo + bg00_sh * (1.0 - a_lo)) * bevel
     comp02 = (rgb_lo * a_lo + bg02_sh * (1.0 - a_lo)) * bevel
 
-    # Derive _01 (hover) and _03 (disabled) from _00
-    comp01 = _make_hover_state(comp00)
+    # Derive _01 (hover + top light overlay) and _03 (disabled) from _00
+    comp01 = _make_hover_state(comp00, light_overlay=light_overlay)
     comp03 = _make_disabled_state(comp00)
 
     out: Dict[str, np.ndarray] = {}
