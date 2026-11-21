@@ -133,38 +133,65 @@ class TextureResolver:
         if self._pak_index is not None:
             return
         self._pak_index = {}
-        if not self.game_dir:
-            return
-        res_dir = os.path.join(self.game_dir, "resource")
-        if not os.path.isdir(res_dir):
-            return
-        # Prioritize texture*.pak, then others
-        paks = []
-        for fn in os.listdir(res_dir):
-            if fn.lower().endswith(".pak"):
-                paks.append(os.path.join(res_dir, fn))
-        paks.sort(key=lambda p: (0 if "texture" in os.path.basename(p).lower() else 1, os.path.basename(p).lower()))
+        pak_dirs = []
+        if self.mod_dir:
+            mod_res = os.path.join(self.mod_dir, "resource")
+            if os.path.isdir(mod_res):
+                pak_dirs.append(mod_res)
+        if self.game_dir:
+            game_res = os.path.join(self.game_dir, "resource")
+            if os.path.isdir(game_res):
+                pak_dirs.append(game_res)
 
-        for pak_path in paks:
-            try:
-                with zipfile.ZipFile(pak_path, "r") as zf:
-                    for name in zf.namelist():
-                        low = name.replace("\\", "/").lower()
-                        if low not in self._pak_index:
-                            self._pak_index[low] = (pak_path, name)
-            except Exception:
-                continue
+        for res_dir in pak_dirs:
+            # Prioritize texture*.pak, then others
+            paks = []
+            for fn in os.listdir(res_dir):
+                if fn.lower().endswith(".pak"):
+                    paks.append(os.path.join(res_dir, fn))
+            paks.sort(key=lambda p: (0 if "texture" in os.path.basename(p).lower() else 1, os.path.basename(p).lower()))
+
+            for pak_path in paks:
+                try:
+                    with zipfile.ZipFile(pak_path, "r") as zf:
+                        for name in zf.namelist():
+                            low = name.replace("\\", "/").lower()
+                            if low not in self._pak_index:
+                                self._pak_index[low] = (pak_path, name)
+                except Exception:
+                    continue
 
     def _try_file(self, base_path: str) -> Optional[str]:
         if os.path.isfile(base_path):
+            if base_path.lower().endswith(".tex"):
+                frame = _parse_tex_frame(base_path)
+                if frame:
+                    return self._try_file(os.path.join(os.path.dirname(base_path), frame))
             return base_path
+        # Case-insensitive exact match in parent dir
+        parent = os.path.dirname(base_path)
+        base_name = os.path.basename(base_path)
         root, ext = os.path.splitext(base_path)
-        if ext.lower() in TEXTURE_EXTS:
-            return None
-        for e in TEXTURE_EXTS:
-            cand = base_path + e
+        if ext.lower() not in TEXTURE_EXTS:
+            for e in TEXTURE_EXTS:
+                cand = base_path + e
+                if os.path.isfile(cand):
+                    return cand
+        # Check .tex wrapper files (e.g. foo.tif.tex, foo.bmp.tex, foo.tex)
+        for tex_ext in (".tex", ".tif.tex", ".tga.tex", ".bmp.tex", ".dds.tex"):
+            cand = base_path + tex_ext
             if os.path.isfile(cand):
-                return cand
+                frame = _parse_tex_frame(cand)
+                if frame:
+                    hit = self._try_file(os.path.join(parent, frame))
+                    if hit:
+                        return hit
+        # If base_path had an extension like .tif or .bmp that doesn't exist, try swapping to .dds/.tga/.bmp/.png
+        if ext and ext.lower() not in (".dds",):
+            for e in TEXTURE_EXTS:
+                cand = root + e
+                if os.path.isfile(cand):
+                    return cand
         return None
 
     def _try_pak(self, rel_path: str) -> Optional[str]:
@@ -222,6 +249,8 @@ class TextureResolver:
                 result = self._try_file(os.path.join(self.game_dir, "resource", rel))
             if not result:
                 result = self._try_pak(rel)
+            if not result and rel.lower().startswith("entity/"):
+                result = self._try_pak(rel[len("entity/"):])
         else:
             # 1. Relative to vehicle_dir
             result = self._try_file(os.path.join(vehicle_dir, ref))
@@ -248,17 +277,44 @@ class TextureResolver:
 
 
 # ---------------------------------------------------------------------------
-# .mtl parser
+# .mtl and .tex ({Bitmap}) parser
 # ---------------------------------------------------------------------------
+
+def _parse_tex_frame(tex_path: str) -> Optional[str]:
+    """Extract {Frame "..."} from a GEM2 .tex ({Bitmap ...}) file."""
+    if not os.path.isfile(tex_path):
+        return None
+    try:
+        nodes = parse_gem2_text(_read_text(tex_path))
+    except Exception:
+        return None
+    for node in nodes:
+        if isinstance(node, list) and node and str(node[0]).lower() == "bitmap":
+            for item in node[1:]:
+                if isinstance(item, list) and len(item) > 1 and str(item[0]).lower() == "frame":
+                    return str(item[1])
+    return None
+
 
 def parse_mtl(mtl_path: str) -> Gem2Material:
     name = os.path.basename(mtl_path)
     mat = Gem2Material(name=name)
     if not os.path.isfile(mtl_path):
+        # Fallback: direct texture filename referenced by .ply (e.g. foo.tif.tex or foo.dds)
+        low = name.lower()
+        if low.endswith(".tex"):
+            stem = name[:-4]
+            stem_no_ext = os.path.splitext(stem)[0]
+            mat.diffuse = stem_no_ext or stem
+        elif os.path.splitext(low)[1] in TEXTURE_EXTS:
+            mat.diffuse = name
         return mat
     nodes = parse_gem2_text(_read_text(mtl_path))
     for node in nodes:
-        if isinstance(node, list) and node and str(node[0]).lower() == "material":
+        if not isinstance(node, list) or not node:
+            continue
+        head = str(node[0]).lower()
+        if head == "material":
             if len(node) > 1 and isinstance(node[1], str):
                 mat.shader = node[1].lower()
             for item in node[1:]:
@@ -286,6 +342,19 @@ def parse_mtl(mtl_path: str) -> Gem2Material:
                             mat.color = (r, g, b, a)
                         except ValueError:
                             pass
+        elif head == "bitmap":
+            # GEM2 .tex material wrapper: {Bitmap {Blend ...} {Frame "texture.dds"}}
+            for item in node[1:]:
+                if not isinstance(item, list) or not item:
+                    continue
+                key = str(item[0]).lower()
+                if key == "frame" and len(item) > 1:
+                    mat.diffuse = str(item[1])
+                elif key == "blend" and len(item) > 1:
+                    mat.blend = str(item[1]).lower()
+    if mat.diffuse is None and name.lower().endswith(".tex"):
+        stem = name[:-4]
+        mat.diffuse = os.path.splitext(stem)[0] or stem
     return mat
 
 
@@ -370,26 +439,36 @@ def parse_ply(ply_path: str) -> Gem2Ply:
                     # Extra weights (rare): +4 bytes per extra weight
                     if stride in (40, 56):
                         n_off = 20
+                        uv_off = 32
                     elif stride in (44, 60):
-                        n_off = 24
+                        # Could be 4-byte vertex color after normal, or 2nd blend weight
+                        n_off = 20
+                        uv_off = 36
                     elif stride in (48, 64):
                         n_off = 28
+                        uv_off = 40
                     else:
                         n_off = 20
+                        uv_off = 32
                 else:
                     # Standard rigid strides:
                     # 32 = pos(12) + norm(12) + uv(8)
+                    # 36 = pos(12) + norm(12) + color(4) + uv(8)
                     # 48 = pos(12) + norm(12) + uv(8) + tan(16)
+                    # 52 = pos(12) + norm(12) + color(4) + uv(8) + tan(16)
                     n_off = 12
+                    has_vcolor = (stride in (36, 52)) or ((stride > 32) and ((stride - 32) % 16 == 4))
+                    uv_off = 28 if has_vcolor else 24
 
                 if n_off + 12 <= stride:
                     normals = raw[:, n_off:n_off + 12].view(np.float32).reshape(nverts, 3).copy()
                 else:
                     normals = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (nverts, 1))
 
-                uv_off = n_off + 12
                 if uv_off + 8 <= stride:
                     uvs = raw[:, uv_off:uv_off + 8].view(np.float32).reshape(nverts, 2).copy()
+                    # Sanitize any non-finite UVs just in case
+                    uvs = np.where(np.isfinite(uvs), uvs, 0.0)
                     # Flip V for OpenGL/Blender convention (DirectX V=0 top -> Blender V=0 bottom)
                     uvs[:, 1] = 1.0 - uvs[:, 1]
                 else:
